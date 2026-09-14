@@ -344,8 +344,10 @@ class SQLiteVecIndex:
                     "SELECT c.entity_id, c.chunk_key, vector_matches.distance "
                     "FROM vector_matches "
                     "JOIN search_vector_chunks c ON c.id = vector_matches.rowid "
-                    "AND c.source_hash = vector_matches.source_hash "
-                    "WHERE c.project_id = :project_id "
+                    # unary + blocks SQLite pushing this equality into the
+                    # vec0 KNN scan, which rejects WHERE on auxiliary columns
+                    "WHERE +c.source_hash = +vector_matches.source_hash "
+                    "AND c.project_id = :project_id "
                     "AND c.vector_index = 'sqlite-vec' "
                     "AND c.embedding_status = 'ready' "
                     "AND c.embedding_model = :embedding_identity "
