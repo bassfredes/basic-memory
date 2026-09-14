@@ -19,4 +19,3 @@ To adopt a newer upstream release, create a new maintenance branch at that relea
 The regression calls SQLiteVecIndex.search against a real sqlite-vec database and checks that current vectors are returned while stale generations and other projects are excluded.
 
 No user notes, client configurations, credentials or machine-specific integration files belong in this public fork.
-
