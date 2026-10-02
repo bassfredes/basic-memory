@@ -16,6 +16,8 @@ from basic_memory.cli.auth import CLIAuth
 from basic_memory.index.note_content_materialization import drain_pending_materializations
 from basic_memory.db import scoped_session
 from basic_memory.index.local_schedulers import drain_background_tasks
+from basic_memory.index.watch_leader import LeaderElectedWatch
+from basic_memory.config_models import resolve_data_dir
 from basic_memory.mcp.client_info import MCPClientInfoMiddleware
 from basic_memory.mcp.container import McpContainer, set_container
 from basic_memory.read_cache import ReadCache, ReadCacheUnavailable
@@ -175,7 +177,10 @@ async def lifespan(app: FastMCP):
                     await _log_embedding_status(db._session_maker)
 
                 # Create and start local watch coordinator (lifecycle centralized in coordinator)
-                watch_coordinator = container.create_watch_coordinator()
+                # One watcher across processes sharing this data directory (fork patch).
+                watch_coordinator = LeaderElectedWatch(
+                    container.create_watch_coordinator(), resolve_data_dir() / "watch.lock"
+                )
                 await watch_coordinator.start()
 
             try:
