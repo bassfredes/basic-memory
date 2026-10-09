@@ -8,7 +8,9 @@ import pytest
 from basic_memory.index import watch_leader
 from basic_memory.index.watch_leader import LeaderElectedWatch, try_acquire
 
-pytestmark = pytest.mark.skipif(watch_leader.fcntl is None, reason="flock is POSIX-only")
+pytestmark = pytest.mark.skipif(
+    watch_leader.fcntl is None and watch_leader.msvcrt is None, reason="no OS file lock"
+)
 
 
 @dataclass
@@ -33,6 +35,50 @@ def test_lock_is_exclusive_until_released(tmp_path):
     second = try_acquire(lock)
     assert second is not None
     watch_leader.os.close(second)
+
+
+def test_holder_pid_stays_readable(tmp_path):
+    lock = tmp_path / "watch.lock"
+    fd = try_acquire(lock)
+    try:
+        # Another reader (cat watch.lock, a follower) must see the PID while it is held.
+        assert lock.read_text() == str(watch_leader.os.getpid())
+    finally:
+        watch_leader.os.close(fd)
+
+
+def test_lock_is_released_when_the_holder_process_exits(tmp_path):
+    import subprocess
+    import sys
+
+    lock = tmp_path / "watch.lock"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys,time; from basic_memory.index.watch_leader import try_acquire; "
+            "from pathlib import Path; fd=try_acquire(Path(sys.argv[1])); "
+            "print('held' if fd is not None else 'free', flush=True); time.sleep(60)",
+            str(lock),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert try_acquire(lock) is None
+    finally:
+        holder.kill()
+        holder.wait()
+        holder.stdout.close()
+    # Windows releases a dead process's locks asynchronously; followers retry anyway.
+    import time
+
+    deadline = time.monotonic() + 5
+    while (fd := try_acquire(lock)) is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert fd is not None
+    watch_leader.os.close(fd)
 
 
 @pytest.mark.asyncio

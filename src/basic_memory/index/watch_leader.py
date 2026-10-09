@@ -4,9 +4,10 @@ Every MCP client session starts its own server process. On WSL, where watchfiles
 falls back to polling, each of those processes would poll and re-index the same
 project tree, multiplying CPU, filesystem-bridge load and duplicate indexing.
 Only the process holding an exclusive lock on ``<data dir>/watch.lock`` runs the
-watcher; the others serve requests and retry periodically. The kernel drops an
-flock together with its process, so a follower takes over (including the
-coordinator's normal startup recovery scan) when the holder exits.
+watcher; the others serve requests and retry periodically. The OS drops the lock
+(flock on POSIX, a msvcrt byte-range lock on Windows) together with its process,
+so a follower takes over (including the coordinator's normal startup recovery
+scan) when the holder exits.
 """
 
 from __future__ import annotations
@@ -22,17 +23,25 @@ from basic_memory.index.watch_coordinator import WatchCoordinator
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Windows has no flock; keep upstream behavior
+except ImportError:  # pragma: no cover - Windows uses msvcrt below
     fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX uses fcntl above
+    msvcrt = None  # type: ignore[assignment]
 
 LOCK_ENV = "BASIC_MEMORY_WATCH_LEADER_LOCK"
 RETRY_ENV = "BASIC_MEMORY_WATCH_LEADER_RETRY_SECONDS"
 DEFAULT_RETRY_SECONDS = 30.0
+# Windows locks a byte range, and a locked byte cannot be read by other processes.
+# Lock one byte far past the PID text so the holder's PID stays readable.
+WINDOWS_LOCK_OFFSET = 1 << 20
 
 
 def leader_lock_enabled() -> bool:
-    """Leader election is on by default wherever flock exists."""
-    return fcntl is not None and os.getenv(LOCK_ENV, "true").lower() not in {
+    """Leader election is on by default wherever an OS file lock exists."""
+    return (fcntl is not None or msvcrt is not None) and os.getenv(LOCK_ENV, "true").lower() not in {
         "0",
         "false",
         "no",
@@ -42,20 +51,37 @@ def leader_lock_enabled() -> bool:
 
 def try_acquire(lock_path: Path) -> int | None:
     """Return a locked file descriptor, or None when another process holds it."""
-    assert fcntl is not None
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        return None
+        if not _lock_nonblocking(fd):
+            os.close(fd)
+            return None
     except OSError:
         os.close(fd)
         raise
+    os.lseek(fd, 0, os.SEEK_SET)
     os.ftruncate(fd, 0)
     os.write(fd, str(os.getpid()).encode())
     return fd
+
+
+def _lock_nonblocking(fd: int) -> bool:
+    """Take an exclusive lock without waiting; False when another process holds it."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    assert msvcrt is not None
+    os.lseek(fd, WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except PermissionError:
+        # LK_NBLCK fails with EACCES when the byte is locked by another handle.
+        return False
+    return True
 
 
 class LeaderElectedWatch:
@@ -82,7 +108,7 @@ class LeaderElectedWatch:
         return self._fd is not None
 
     async def start(self) -> None:
-        # Trigger: watching disabled (test/cloud/index_changes=false) or no flock.
+        # Trigger: watching disabled (test/cloud/index_changes=false) or no OS file lock.
         # Why: those paths keep their existing behavior exactly.
         if not self.coordinator.should_watch or not leader_lock_enabled():
             await self.coordinator.start()
